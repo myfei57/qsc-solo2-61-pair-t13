@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tunnelnet.access import AccessService
+from tunnelnet.access import AccessService, DoorLedger
 from tunnelnet.audit import AuditRegistry, MarkSet
 from tunnelnet.cabin import PartitionTable, PowerBook, Registry as CabinRegistry, SuppressionLog
 from tunnelnet.cable import CableRegistry, MovingAverage
@@ -30,7 +30,9 @@ class Runtime:
         self.filter = MovingAverage(3)
         self.cables = CableRegistry()
         self.env = Environment(self.filter, self.partitions, DEFAULT_THRESHOLD)
-        self.access = AccessService(store, self.cabins)
+        self.audit = AuditRegistry(store)
+        self.doors = DoorLedger(store, self.cabins, self.audit)
+        self.access = AccessService(store, self.doors)
         self.pump = PumpUnit()
         self.drain = DrainService(self.cabins, self.pump, store)
         self.ventilation = VentService()
@@ -40,4 +42,3 @@ class Runtime:
         self.patrol = PatrolService(self.cabins)
         self.power_book = PowerBook()
         self.quota = QuotaService(self.cabins, self.power_book)
-        self.audit = AuditRegistry()

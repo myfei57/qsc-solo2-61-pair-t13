@@ -5,7 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 
-from tunnelnet.access import AccessService, summarize
+from tunnelnet.access import AccessService, DoorLedger, summarize
 from tunnelnet.audit import (
     AuditRegistry,
     MarkSet,
@@ -76,8 +76,12 @@ from tunnelnet.store import (
     Store,
     approval_exists,
     describe_store,
+    epoch_to_iso,
+    expires_at_of,
     export_all,
     export_kind,
+    is_expired,
+    iso_to_epoch,
     list_approvals,
     load_approval,
     load_mark,
@@ -139,15 +143,40 @@ class StoreRecordCase(unittest.TestCase):
             self.assertTrue(approval_exists(store, "a1"))
             self.assertEqual(load_approval(store, "a1"), approval)
             self.assertEqual([item.id for item in list_approvals(store)], ["a1"])
-            self.assertTrue(revoke_approval(store, "a1"))
-            self.assertFalse(revoke_approval(store, "a1"))
-            self.assertIsNone(load_approval(store, "a1"))
+            revoked = revoke_approval(store, "a1", "later")
+            self.assertEqual(revoked.status, "revoked")
+            self.assertEqual(revoked.revoked_at, "later")
+            self.assertEqual(revoke_approval(store, "a1", "again"), revoked)
+            self.assertEqual(load_approval(store, "a1"), revoked)
+            self.assertIsNone(revoke_approval(store, "ghost"))
 
             mark = ExecutionMark(key="k1", executed_at="now")
             save_mark(store, mark)
             self.assertTrue(mark_exists(store, "k1"))
             self.assertEqual(load_mark(store, "k1"), mark)
             self.assertIsNone(load_mark(store, "k2"))
+
+    def test_approval_validity_window(self) -> None:
+        approval = Approval(
+            id="a1",
+            cabin_id="cabin-1",
+            requester="ops",
+            granted_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-01T08:00:00Z",
+        )
+        self.assertEqual(expires_at_of(approval, 3600), "2026-01-01T08:00:00Z")
+        self.assertFalse(is_expired(approval, "2026-01-01T07:59:59Z", 3600))
+        self.assertTrue(is_expired(approval, "2026-01-01T08:00:00Z", 3600))
+
+        legacy = Approval(id="a2", cabin_id="cabin-1", requester="ops", granted_at="2026-01-01T00:00:00Z")
+        self.assertEqual(expires_at_of(legacy, 3600), "2026-01-01T01:00:00Z")
+        self.assertTrue(is_expired(legacy, "2026-01-01T01:00:01Z", 3600))
+
+        unreadable = Approval(id="a3", cabin_id="cabin-1", requester="ops", granted_at="not-a-stamp")
+        self.assertEqual(expires_at_of(unreadable, 3600), "1970-01-01T00:00:00Z")
+        self.assertTrue(is_expired(unreadable, "2026-01-01T00:00:00Z", 3600))
+        self.assertEqual(epoch_to_iso(0.0), "1970-01-01T00:00:00Z")
+        self.assertIsNone(iso_to_epoch("not-a-stamp"))
 
     def test_exports_and_projections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,14 +559,31 @@ class PatrolCase(unittest.TestCase):
         self.assertEqual(overdue_cabins([], [], {}, "now"), [])
 
 
+class FakeClock:
+    """Mutable clock so tests decide when time advances."""
+
+    def __init__(self, start: str = "2026-01-01T00:00:00Z") -> None:
+        self.now = start
+
+    def __call__(self) -> str:
+        return self.now
+
+
 class AccessCase(unittest.TestCase):
+    def _service(self, tmp: str, clock=None):
+        store = Store.open(tmp)
+        cabins = CabinRegistry()
+        cabins.upsert(Cabin(id="cabin-1"))
+        cabins.upsert(Cabin(id="cabin-2"))
+        audit = AuditRegistry(store)
+        stamp = clock if clock is not None else FakeClock()
+        doors = DoorLedger(store, cabins, audit, clock=stamp)
+        access = AccessService(store, doors, clock=stamp, default_ttl_seconds=3600)
+        return access, doors, cabins, audit, store
+
     def test_requests_and_durable_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store.open(tmp)
-            cabins = CabinRegistry()
-            cabins.upsert(Cabin(id="cabin-1"))
-            cabins.upsert(Cabin(id="cabin-2"))
-            access = AccessService(store, cabins)
+            access, _, cabins, _, store = self._service(tmp)
 
             request = access.submit("cabin-1", "ops")
             self.assertEqual(request.status, "pending")
@@ -549,12 +595,15 @@ class AccessCase(unittest.TestCase):
             self.assertTrue(cabins.door_state("cabin-1"))
             self.assertTrue(access.approved(approval.id))
             self.assertEqual(approval.cabin_id, "cabin-1")
+            self.assertEqual(approval.status, "active")
+            self.assertEqual(approval.expires_at, "2026-01-01T01:00:00Z")
             self.assertEqual(access.summary()["granted"], 1)
             self.assertEqual(access.pending(), [])
 
-            direct = access.approve("cabin-2", "ops")
+            direct = access.approve("cabin-2", "ops", ttl_seconds=60)
             self.assertTrue(cabins.door_state("cabin-2"))
             self.assertTrue(access.approved(direct.id))
+            self.assertEqual(direct.expires_at, "2026-01-01T00:01:00Z")
             self.assertEqual(access.state().granted, 1)
             self.assertEqual(len(list_approvals(store)), 2)
             self.assertIn("requests=1", access.describe())
@@ -562,8 +611,201 @@ class AccessCase(unittest.TestCase):
             with self.assertRaises(ValueError):
                 access.grant("ghost")
 
+    def test_approval_expires_and_sweep_reclaims_door(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = FakeClock()
+            access, doors, cabins, audit, _ = self._service(tmp, clock=clock)
+            approval = access.approve("cabin-1", "ops")
+            self.assertTrue(access.is_valid(approval.id))
+            clock.now = "2026-01-01T02:00:00Z"
+            self.assertFalse(access.is_valid(approval.id))
+
+            expired = access.sweep_expired()
+            self.assertEqual([item.id for item in expired], [approval.id])
+            self.assertEqual(expired[0].status, "expired")
+            self.assertFalse(cabins.door_state("cabin-1"))
+            self.assertFalse(doors.state("cabin-1").released)
+            self.assertEqual(access.sweep_expired(), [])
+            self.assertIn("access_expired", [record.event for record in audit.records()])
+
+    def test_revoke_reclaims_door_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            access, doors, cabins, audit, _ = self._service(tmp)
+            approval = access.approve("cabin-1", "ops")
+
+            revoked, door = access.revoke(approval.id)
+            self.assertEqual(revoked.status, "revoked")
+            self.assertEqual(door, "sealed")
+            self.assertFalse(cabins.door_state("cabin-1"))
+
+            again, door = access.revoke(approval.id)
+            self.assertEqual(again, revoked)
+            self.assertEqual(door, "already_clear")
+            self.assertEqual(
+                [record.event for record in audit.records()].count("access_revoked"), 1
+            )
+            self.assertEqual(
+                [record.event for record in audit.records()].count("door_sealed"), 1
+            )
+            with self.assertRaises(KeyError):
+                access.revoke("ghost")
+
+    def test_revoke_waits_for_occupants_to_leave(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            access, doors, cabins, audit, _ = self._service(tmp)
+            approval = access.approve("cabin-1", "ops")
+            access.enter(approval.id)
+            self.assertEqual(doors.state("cabin-1").occupancy, 1)
+
+            _, door = access.revoke(approval.id)
+            self.assertEqual(door, "closing_pending")
+            self.assertTrue(cabins.door_state("cabin-1"))
+            self.assertTrue(doors.state("cabin-1").closing_pending)
+            with self.assertRaises(ValueError):
+                access.enter(approval.id)
+
+            record = access.exit(approval.id)
+            self.assertEqual(record.occupancy, 0)
+            self.assertFalse(record.released)
+            self.assertFalse(cabins.door_state("cabin-1"))
+            events = [record.event for record in audit.records()]
+            self.assertIn("door_closing_pending", events)
+            self.assertEqual(events.count("door_sealed"), 1)
+
+    def test_enter_requires_a_valid_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            access, doors, _, audit, _ = self._service(tmp)
+            approval = access.approve("cabin-1", "ops")
+            access.revoke(approval.id)
+            with self.assertRaises(ValueError):
+                access.enter(approval.id)
+            with self.assertRaises(KeyError):
+                access.enter("ghost")
+            self.assertIn("access_enter_denied", [record.event for record in audit.records()])
+
+            manual = doors.release("cabin-2", source="manual")
+            self.assertTrue(manual.released)
+            with self.assertRaises(KeyError):
+                access.enter("ghost")
+
+    def test_expired_approval_cannot_enter_and_migrates_lazily(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = FakeClock()
+            access, doors, cabins, _, _ = self._service(tmp, clock=clock)
+            approval = access.approve("cabin-1", "ops")
+            clock.now = "2026-01-01T02:00:00Z"
+            with self.assertRaises(ValueError):
+                access.enter(approval.id)
+            self.assertFalse(access.is_valid(approval.id))
+            self.assertFalse(cabins.door_state("cabin-1"))
+
+    def test_exit_never_refuses_and_falls_back_to_cabin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            access, doors, _, _, _ = self._service(tmp)
+            approval = access.approve("cabin-1", "ops")
+            access.enter(approval.id)
+            access.revoke(approval.id)
+            record = access.exit(approval.id)
+            self.assertEqual(record.occupancy, 0)
+            record = access.exit("", "cabin-1")
+            self.assertEqual(record.occupancy, 0)
+            with self.assertRaises(KeyError):
+                access.exit("ghost")
+
+    def test_failed_release_revokes_the_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            access, _, _, audit, store = self._service(tmp)
+            with self.assertRaises(ValueError):
+                access.approve("ghost-cabin", "ops")
+            approvals = list_approvals(store)
+            self.assertEqual(len(approvals), 1)
+            self.assertEqual(approvals[0].status, "revoked")
+            self.assertIn("access_revoked", [record.event for record in audit.records()])
+
+    def test_failed_revoke_is_recovered_by_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(tmp)
+            cabins = CabinRegistry()
+            cabins.upsert(Cabin(id="cabin-1"))
+            audit = AuditRegistry(store)
+            doors = DoorLedger(store, cabins, audit, clock=lambda: "2026-01-01T00:00:00Z")
+            access = AccessService(store, doors, clock=lambda: "2026-01-01T00:00:00Z")
+            approval = access.approve("cabin-1", "ops")
+
+            original_seal = doors.seal
+
+            def broken_seal(cabin_id: str, reason: str = "manual"):
+                raise RuntimeError("actuator offline")
+
+            doors.seal = broken_seal  # type: ignore[method-assign]
+            with self.assertRaises(RuntimeError):
+                access.revoke(approval.id)
+            self.assertEqual(load_approval(store, approval.id).status, "revoked")
+            self.assertTrue(doors.state("cabin-1").released)
+
+            doors.seal = original_seal  # type: ignore[method-assign]
+            _, door = access.revoke(approval.id)
+            self.assertEqual(door, "sealed")
+            self.assertFalse(cabins.door_state("cabin-1"))
+
     def test_summary_helper(self) -> None:
         self.assertEqual(summarize([]), {"requests": 0, "pending": 0, "granted": 0})
+
+
+class DoorLedgerCase(unittest.TestCase):
+    def _ledger(self, tmp: str):
+        store = Store.open(tmp)
+        cabins = CabinRegistry()
+        cabins.upsert(Cabin(id="cabin-1"))
+        audit = AuditRegistry(store)
+        ledger = DoorLedger(store, cabins, audit, clock=lambda: "2026-01-01T00:00:00Z")
+        return ledger, cabins, audit, store
+
+    def test_release_seal_and_durability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger, cabins, audit, store = self._ledger(tmp)
+            record = ledger.release("cabin-1", approval_id="a1", source="approval")
+            self.assertTrue(record.released)
+            self.assertEqual(record.approval_id, "a1")
+            self.assertTrue(cabins.door_state("cabin-1"))
+            self.assertEqual(store.load("door", "cabin-1")["approval_id"], "a1")
+
+            sealed = ledger.seal("cabin-1")
+            self.assertFalse(sealed.released)
+            self.assertFalse(cabins.door_state("cabin-1"))
+            self.assertEqual(ledger.seal("cabin-1").released, False)
+            events = [record.event for record in audit.records()]
+            self.assertEqual(events, ["door_released", "door_sealed"])
+
+    def test_reconcile_restores_physical_doors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger, cabins, _, store = self._ledger(tmp)
+            ledger.release("cabin-1", approval_id="a1", source="approval")
+            cabins.seal_door("cabin-1")
+            self.assertFalse(cabins.door_state("cabin-1"))
+
+            restored = CabinRegistry()
+            restored.upsert(Cabin(id="cabin-1"))
+            rebuilt = DoorLedger(store, restored)
+            rebuilt.reconcile()
+            self.assertTrue(restored.door_state("cabin-1"))
+            self.assertEqual(rebuilt.state("cabin-1").approval_id, "a1")
+
+    def test_failed_actuation_rolls_back_the_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger, _, _, store = self._ledger(tmp)
+            with self.assertRaises(ValueError):
+                ledger.release("ghost")
+            self.assertIsNone(store.load("door", "ghost"))
+
+    def test_reset_seals_everything(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger, cabins, _, store = self._ledger(tmp)
+            ledger.release("cabin-1")
+            ledger.reset()
+            self.assertEqual(store.list("door"), [])
+            self.assertFalse(cabins.door_state("cabin-1"))
+            self.assertEqual(ledger.all(), [])
 
 
 class CableCase(unittest.TestCase):
@@ -679,11 +921,27 @@ class AuditCase(unittest.TestCase):
         self.assertEqual([item.id for item in between(records, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")], ["a1", "a2"])
         self.assertEqual(count_by_event(records), {"access": 2, "fire": 1})
         self.assertEqual(summary(records)["total"], 3)
-        self.assertEqual(first.as_dict(), {"id": "a1", "event": "access", "at": "2026-01-01T00:00:00Z"})
+        self.assertEqual(
+            first.as_dict(), {"id": "a1", "event": "access", "at": "2026-01-01T00:00:00Z", "ref": ""}
+        )
         self.assertEqual(second.as_dict()["event"], "fire")
         registry.clear()
         self.assertEqual(registry.count(), 0)
         self.assertIsNone(most_recent([]))
+
+    def test_registry_is_durable_with_a_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(tmp)
+            registry = AuditRegistry(store)
+            registry.append(Record(id="a1", event="access_entered", at="2026-01-01T00:00:00Z", ref="cabin-1"))
+            registry.append(Record(id="a2", event="access_exited", at="2026-01-01T01:00:00Z", ref="cabin-1"))
+            self.assertEqual(store.count("audit"), 2)
+
+            reopened = AuditRegistry(store)
+            self.assertEqual([record.id for record in reopened.records()], ["a1", "a2"])
+            self.assertEqual(reopened.records()[0].ref, "cabin-1")
+            reopened.clear()
+            self.assertEqual(store.count("audit"), 0)
 
     def test_mark_set(self) -> None:
         marks = MarkSet()
@@ -708,10 +966,10 @@ class ReportingCase(unittest.TestCase):
             store = Store.open(tmp)
             store.save("approval", "a1", {"id": "a1"})
             registry = AuditRegistry()
-            registry.append(Record(id="a1", event="access", at="t1"))
+            registry.append(Record(id="a1", event="access", at="t1", ref="cabin-1"))
             columns, rows = audit_export(registry)
-            self.assertEqual(columns, ["id", "event", "at"])
-            self.assertEqual(rows, [["a1", "access", "t1"]])
+            self.assertEqual(columns, ["id", "event", "at", "ref"])
+            self.assertEqual(rows, [["a1", "access", "t1", "cabin-1"]])
             store_columns, store_rows = store_export(store)
             self.assertEqual(store_columns, ["kind", "records"])
             self.assertEqual(store_rows, [["approval", 1]])

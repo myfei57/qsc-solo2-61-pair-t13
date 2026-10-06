@@ -13,7 +13,7 @@ from tunnelnet.fire import Detector
 from tunnelnet.ns import Stage, control_chain
 from tunnelnet.reporting import audit_export, telemetry_export, to_csv
 from tunnelnet.reporting import store_export as store_csv_export
-from tunnelnet.store import export_all, export_kind, list_approvals, revoke_approval, summarize
+from tunnelnet.store import export_all, export_kind, list_approvals, summarize
 
 from . import checks, ops
 from . import describe as describe_module
@@ -180,13 +180,13 @@ def cabin_zone(server: "Server", request: Request) -> Response:
 
 
 def cabin_door(server: "Server", request: Request) -> Response:
-    registry = server.runtime.cabins
+    doors = server.runtime.doors
     cabin_id = request.str_field("id")
     if request.payload.get("release", True):
-        registry.release_door(cabin_id)
+        record = doors.release(cabin_id, source="manual")
     else:
-        registry.seal_door(cabin_id)
-    return json_response({"id": cabin_id, "open": registry.door_state(cabin_id)})
+        record = doors.seal(cabin_id, reason="manual")
+    return json_response({"id": cabin_id, "open": record.released})
 
 
 def cabin_valve(server: "Server", request: Request) -> Response:
@@ -227,7 +227,13 @@ def access_approvals(server: "Server", request: Request) -> Response:
     for approval in list_approvals(server.runtime.store):
         payload = approval.as_dict()
         payload["durable"] = access.approved(approval.id)
+        payload["valid"] = access.is_valid(approval.id)
         items.append(payload)
+    return json_response({"items": items})
+
+
+def access_doors(server: "Server", request: Request) -> Response:
+    items = [record.as_dict() for record in server.runtime.doors.all()]
     return json_response({"items": items})
 
 
@@ -237,22 +243,58 @@ def access_submit(server: "Server", request: Request) -> Response:
 
 
 def access_grant(server: "Server", request: Request) -> Response:
-    approval = server.runtime.access.grant(request.str_field("request_id"))
-    record_event(server.runtime, "access_granted", approval.id)
+    approval = server.runtime.access.grant(
+        request.str_field("request_id"), ttl_seconds=request.int_field("ttl_seconds", 0)
+    )
     return json_response(approval.as_dict())
 
 
 def access_approve(server: "Server", request: Request) -> Response:
-    approval = server.runtime.access.approve(request.str_field("cabin_id"), request.str_field("requester"))
-    record_event(server.runtime, "access_approved", approval.id)
+    approval = server.runtime.access.approve(
+        request.str_field("cabin_id"),
+        request.str_field("requester"),
+        ttl_seconds=request.int_field("ttl_seconds", 0),
+    )
     return json_response(approval.as_dict())
 
 
 def access_revoke(server: "Server", request: Request) -> Response:
     approval_id = request.str_field("approval_id")
-    if not revoke_approval(server.runtime.store, approval_id):
+    if not approval_id:
+        raise RequestError(400, "approval_id is required")
+    try:
+        approval, door = server.runtime.access.revoke(approval_id)
+    except KeyError:
         raise RequestError(404, "approval not found")
-    return json_response({"revoked": approval_id})
+    return json_response({"revoked": approval.id, "status": approval.status, "door": door})
+
+
+def access_enter(server: "Server", request: Request) -> Response:
+    approval_id = request.str_field("approval_id")
+    if not approval_id:
+        raise RequestError(400, "approval_id is required")
+    try:
+        record = server.runtime.access.enter(approval_id)
+    except KeyError:
+        raise RequestError(404, "approval not found")
+    return json_response(record.as_dict())
+
+
+def access_exit(server: "Server", request: Request) -> Response:
+    approval_id = request.str_field("approval_id")
+    cabin_id = request.str_field("cabin_id")
+    if not approval_id and not cabin_id:
+        raise RequestError(400, "approval_id or cabin_id is required")
+    try:
+        record = server.runtime.access.exit(approval_id, cabin_id)
+    except KeyError:
+        raise RequestError(404, "approval not found")
+    return json_response(record.as_dict())
+
+
+def access_sweep(server: "Server", request: Request) -> Response:
+    expired = server.runtime.access.sweep_expired()
+    return json_response({"expired": [item.id for item in expired], "count": len(expired)})
 
 
 def env_overview(server: "Server", request: Request) -> Response:

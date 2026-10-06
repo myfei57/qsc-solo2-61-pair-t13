@@ -247,25 +247,82 @@ class ConsoleCase(unittest.TestCase):
         status, approval = self.call("POST", "/api/access/grant", {"request_id": request["id"]})
         self.assertEqual(status, 200)
         self.assertEqual(approval["cabin_id"], "cabin-1")
+        self.assertEqual(approval["status"], "active")
+        self.assertGreater(approval["expires_at"], approval["granted_at"])
 
         status, approvals = self.call("GET", "/api/access/approvals")
         self.assertEqual(status, 200)
         self.assertTrue(approvals["items"][0]["durable"])
+        self.assertTrue(approvals["items"][0]["valid"])
 
-        status, direct = self.call("POST", "/api/access/approve", {"cabin_id": "cabin-2", "requester": "ops"})
+        status, direct = self.call(
+            "POST", "/api/access/approve", {"cabin_id": "cabin-2", "requester": "ops", "ttl_seconds": 60}
+        )
         self.assertEqual(direct["cabin_id"], "cabin-2")
+
+        status, doors = self.call("GET", "/api/access/doors")
+        self.assertEqual(status, 200)
+        self.assertEqual({item["cabin_id"] for item in doors["items"]}, {"cabin-1", "cabin-2"})
+        self.assertTrue(all(item["released"] for item in doors["items"]))
+
+        status, entered = self.call("POST", "/api/access/enter", {"approval_id": direct["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(entered["occupancy"], 1)
 
         status, summary = self.call("GET", "/api/access/summary")
         self.assertEqual(summary["requests"], 1)
         self.assertEqual(summary["granted"], 1)
 
         status, body = self.call("POST", "/api/access/revoke", {"approval_id": direct["id"]})
-        self.assertTrue(body["revoked"])
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "revoked")
+        self.assertEqual(body["door"], "closing_pending")
+
         status, body = self.call("POST", "/api/access/revoke", {"approval_id": direct["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "revoked")
+
+        status, body = self.call("POST", "/api/access/enter", {"approval_id": direct["id"]})
+        self.assertEqual(status, 400)
+
+        status, exited = self.call("POST", "/api/access/exit", {"approval_id": direct["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(exited["occupancy"], 0)
+        self.assertFalse(exited["released"])
+
+        status, body = self.call("POST", "/api/access/revoke", {"approval_id": "ghost"})
         self.assertEqual(status, 404)
+
+        status, swept = self.call("POST", "/api/access/sweep")
+        self.assertEqual(status, 200)
+        self.assertEqual(swept["count"], 0)
 
         status, body = self.call("POST", "/api/access/grant", {"request_id": "ghost"})
         self.assertEqual(status, 400)
+
+    def test_access_state_survives_a_restart(self) -> None:
+        _, approval = self.call("POST", "/api/access/approve", {"cabin_id": "cabin-1", "requester": "ops"})
+        self.call("POST", "/api/access/enter", {"approval_id": approval["id"]})
+
+        restarted = Server(self.store, web_dir="web")
+        response = restarted.dispatch("GET", "/api/access/doors")
+        doors = json.loads(response.body.decode("utf-8"))["items"]
+        self.assertEqual(len(doors), 1)
+        self.assertTrue(doors[0]["released"])
+        self.assertEqual(doors[0]["occupancy"], 1)
+        self.assertTrue(self.server.runtime.cabins.door_state("cabin-1"))
+        self.assertTrue(restarted.runtime.cabins.door_state("cabin-1"))
+
+        response = restarted.dispatch("GET", "/api/audit")
+        audit = json.loads(response.body.decode("utf-8"))
+        self.assertGreaterEqual(audit["count"], 3)
+        events = {item["event"] for item in audit["items"]}
+        self.assertIn("access_approved", events)
+        self.assertIn("access_entered", events)
+
+        response = restarted.dispatch("POST", "/api/access/revoke", {"approval_id": approval["id"]})
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(body["door"], "closing_pending")
 
     def test_environment_routes(self) -> None:
         status, overview = self.call("GET", "/api/env")

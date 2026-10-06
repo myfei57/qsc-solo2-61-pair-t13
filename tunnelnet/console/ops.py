@@ -48,6 +48,8 @@ def collect(rt: "Runtime") -> OpsCounters:
 def reset_store(rt: "Runtime") -> dict[str, object]:
     """Clear every persisted record, as a factory reset would."""
 
+    rt.doors.reset()
+    rt.audit.clear()
     for kind in rt.store.kinds():
         for record_id in rt.store.list(kind):
             rt.store.delete(kind, record_id)

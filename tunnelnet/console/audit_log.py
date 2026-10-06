@@ -16,9 +16,9 @@ def record_event(rt: "Runtime", event: str, ref: str = "") -> list[Record]:
     """Append an audit event and, when a reference is given, its ``_ref`` twin."""
 
     stamp = utc_now()
-    entries = [Record(id=uuid.uuid4().hex, event=event, at=stamp)]
+    entries = [Record(id=uuid.uuid4().hex, event=event, at=stamp, ref=ref)]
     if ref:
-        entries.append(Record(id=uuid.uuid4().hex, event=f"{event}_ref", at=stamp))
+        entries.append(Record(id=uuid.uuid4().hex, event=f"{event}_ref", at=stamp, ref=ref))
     for entry in entries:
         rt.audit.append(entry)
     return entries

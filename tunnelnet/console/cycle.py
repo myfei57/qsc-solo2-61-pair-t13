@@ -23,8 +23,8 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
 
     reading = sum(samples) / len(samples) if samples else fallback
 
+    expired = rt.access.sweep_expired()
     approval = rt.access.approve(cabin_id, requester)
-    record_event(rt, "access_approved", approval.id)
 
     alarmed = rt.env.sample(sensor_id, reading, at)
 
@@ -45,6 +45,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
     return json_response(
         {
             "approval": approval.id,
+            "expired": [item.id for item in expired],
             "alarmed": alarmed,
             "reading": reading,
             "zones": zones,

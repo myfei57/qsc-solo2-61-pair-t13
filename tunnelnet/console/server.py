@@ -21,6 +21,7 @@ class Server:
     def __init__(self, store: Store, web_dir: str = "web") -> None:
         self.runtime = Runtime(store)
         seed_defaults(self.runtime)
+        self.runtime.doors.reconcile()
         self.web_dir = web_dir
         self.router = Router()
         self.metrics = Metrics()
