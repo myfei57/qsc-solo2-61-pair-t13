@@ -139,9 +139,13 @@ class StoreRecordCase(unittest.TestCase):
             self.assertTrue(approval_exists(store, "a1"))
             self.assertEqual(load_approval(store, "a1"), approval)
             self.assertEqual([item.id for item in list_approvals(store)], ["a1"])
+            # Revoking moves the lifecycle status but keeps the document for audit.
             self.assertTrue(revoke_approval(store, "a1"))
             self.assertFalse(revoke_approval(store, "a1"))
-            self.assertIsNone(load_approval(store, "a1"))
+            revoked = load_approval(store, "a1")
+            self.assertIsNotNone(revoked)
+            self.assertEqual(revoked.status, "revoked")
+            self.assertFalse(approval_exists(store, "a1"))
 
             mark = ExecutionMark(key="k1", executed_at="now")
             save_mark(store, mark)

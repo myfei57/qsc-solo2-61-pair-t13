@@ -13,7 +13,7 @@ from tunnelnet.fire import Detector
 from tunnelnet.ns import Stage, control_chain
 from tunnelnet.reporting import audit_export, telemetry_export, to_csv
 from tunnelnet.reporting import store_export as store_csv_export
-from tunnelnet.store import export_all, export_kind, list_approvals, revoke_approval, summarize
+from tunnelnet.store import export_all, export_kind, list_approvals, summarize
 
 from . import checks, ops
 from . import describe as describe_module
@@ -227,6 +227,7 @@ def access_approvals(server: "Server", request: Request) -> Response:
     for approval in list_approvals(server.runtime.store):
         payload = approval.as_dict()
         payload["durable"] = access.approved(approval.id)
+        payload["state"] = access.status(approval.id)
         items.append(payload)
     return json_response({"items": items})
 
@@ -236,23 +237,91 @@ def access_submit(server: "Server", request: Request) -> Response:
     return json_response(item.payload())
 
 
+def _validity_options(request: Request) -> dict[str, object]:
+    options: dict[str, object] = {}
+    if request.payload.get("valid_for_seconds") is not None:
+        options["valid_for_seconds"] = request.int_field("valid_for_seconds")
+    if request.payload.get("activation_window_seconds") is not None:
+        options["activation_window_seconds"] = request.int_field("activation_window_seconds")
+    return options
+
+
 def access_grant(server: "Server", request: Request) -> Response:
-    approval = server.runtime.access.grant(request.str_field("request_id"))
+    try:
+        approval = server.runtime.access.grant(
+            request.str_field("request_id"), **_validity_options(request)
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
     record_event(server.runtime, "access_granted", approval.id)
     return json_response(approval.as_dict())
 
 
 def access_approve(server: "Server", request: Request) -> Response:
-    approval = server.runtime.access.approve(request.str_field("cabin_id"), request.str_field("requester"))
+    try:
+        approval = server.runtime.access.approve(
+            request.str_field("cabin_id"),
+            request.str_field("requester"),
+            **_validity_options(request),  # type: ignore[arg-type]
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
     record_event(server.runtime, "access_approved", approval.id)
     return json_response(approval.as_dict())
 
 
 def access_revoke(server: "Server", request: Request) -> Response:
+    access = server.runtime.access
     approval_id = request.str_field("approval_id")
-    if not revoke_approval(server.runtime.store, approval_id):
+    reason = request.str_field("reason")
+    force = request.str_field("force_seal") in ("1", "true", "True")
+    try:
+        changed = access.revoke(approval_id, reason=reason, force_seal=force)
+    except KeyError as exc:
+        raise RequestError(404, "approval not found") from exc
+    record_event(server.runtime, "access_revoked", approval_id)
+    return json_response({"revoked": approval_id, "already": not changed, "state": access.status(approval_id)})
+
+
+def access_enter(server: "Server", request: Request) -> Response:
+    access = server.runtime.access
+    approval_id = request.str_field("approval_id")
+    if not access.enter(approval_id, idem=request.str_field("idem")):
+        raise RequestError(409, "approval does not admit entry")
+    record_event(server.runtime, "access_entered", approval_id)
+    return json_response({"approval_id": approval_id, "occupants": access.occupants(
+        access.approval_state(approval_id).cabin_id
+    )})
+
+
+def access_exit(server: "Server", request: Request) -> Response:
+    access = server.runtime.access
+    approval_id = request.str_field("approval_id")
+    state = access.approval_state(approval_id)
+    if state is None:
         raise RequestError(404, "approval not found")
-    return json_response({"revoked": approval_id})
+    if not access.exit(approval_id, idem=request.str_field("idem")):
+        raise RequestError(409, "holder is not inside")
+    record_event(server.runtime, "access_exited", approval_id)
+    return json_response(
+        {"approval_id": approval_id, "occupants": access.occupants(state.cabin_id), "door_open": access.door_state(state.cabin_id)}
+    )
+
+
+def access_expire(server: "Server", request: Request) -> Response:
+    access = server.runtime.access
+    expired = access.expire_due()
+    return json_response({"expired": expired, "count": len(expired)})
+
+
+def access_reconcile(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.access.reconcile())
+
+
+def access_events(server: "Server", request: Request) -> Response:
+    return json_response(
+        {"events": [event.as_dict() for event in server.runtime.access.stream()]}
+    )
 
 
 def env_overview(server: "Server", request: Request) -> Response:

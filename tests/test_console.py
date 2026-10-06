@@ -261,7 +261,13 @@ class ConsoleCase(unittest.TestCase):
 
         status, body = self.call("POST", "/api/access/revoke", {"approval_id": direct["id"]})
         self.assertTrue(body["revoked"])
+        self.assertFalse(body["already"])
+        # A repeated revocation is idempotent: same withdrawn state, 200.
         status, body = self.call("POST", "/api/access/revoke", {"approval_id": direct["id"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["already"])
+        # Revoking an unknown approval is still a 404.
+        status, body = self.call("POST", "/api/access/revoke", {"approval_id": "ghost"})
         self.assertEqual(status, 404)
 
         status, body = self.call("POST", "/api/access/grant", {"request_id": "ghost"})
